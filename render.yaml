@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: iot-light-mcp
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn server:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: DEVICE_IP
+        sync: false
+      - key: MOCK_MODE
+        value: "true"
