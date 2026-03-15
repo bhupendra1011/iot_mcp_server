@@ -20,65 +20,33 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-DEVICE_IP = os.getenv("DEVICE_IP", "192.168.1.100")
+DEVICE_IP = os.getenv("DEVICE_IP", "192.168.1.50")  # static IP of ESP8266/NodeMCU
 DEVICE_PORT = os.getenv("DEVICE_PORT", "80")
 DEVICE_TIMEOUT = int(os.getenv("DEVICE_TIMEOUT", "10"))
 DEVICE_BASE_URL = f"http://{DEVICE_IP}:{DEVICE_PORT}"
-MOCK_MODE = os.getenv("MOCK_MODE", "false").lower() == "true"
 
-# ─── Color Mapping ─────────────────────────────────────────
-COLOR_MAP = {
-    "red": "#FF0000",
-    "green": "#00FF00",
-    "blue": "#0000FF",
-    "yellow": "#FFFF00",
-    "cyan": "#00FFFF",
-    "magenta": "#FF00FF",
-    "white": "#FFFFFF",
-    "warm_white": "#FFD700",
-    "warm white": "#FFD700",
-    "orange": "#FFA500",
-    "purple": "#800080",
-    "pink": "#FFC0CB",
-    "off": "#000000",
-}
+# ─── Valid Colors (must match Arduino's parseColor) ───────
+VALID_COLORS = [
+    "red", "green", "blue", "yellow", "orange", "purple", "violet",
+    "cyan", "magenta", "pink", "white", "warm_white", "cool_white",
+    "gold", "silver", "lime", "teal", "indigo", "coral", "off",
+]
 
 
 def resolve_color(color_input: str) -> str:
-    """Convert color name to hex, or validate hex input."""
+    """Validate color name or hex code. Arduino accepts names directly."""
     color_lower = color_input.lower().strip()
-    if color_lower in COLOR_MAP:
-        return COLOR_MAP[color_lower]
+    if color_lower in VALID_COLORS:
+        return color_lower
+    # Arduino also accepts hex codes like #FF5500
     if color_lower.startswith("#") and len(color_lower) == 7:
-        return color_lower.upper()
-    return "#FFFFFF"
-
-
-# ─── Mock State (for development without hardware) ─────────
-mock_state = {"on": False, "color": "#FFFFFF", "brightness": 100}
+        return color_lower
+    return "white"
 
 
 # ─── Device Communication ──────────────────────────────────
 async def device_request(method: str, path: str, body: dict = None) -> dict:
-    """Send HTTP request to ESP8266 device, or use mock if MOCK_MODE is enabled."""
-    if MOCK_MODE:
-        if path == "/light" and method == "POST" and body:
-            mock_state.update(body)
-            return {"success": True, "state": dict(mock_state)}
-        elif path == "/status" and method == "GET":
-            return {
-                **mock_state,
-                "device": "MOCK-NodeMCU-SmartLight",
-                "uptime_seconds": 0,
-                "wifi_rssi": 0,
-                "ip": "127.0.0.1",
-            }
-        elif path == "/display" and method == "POST":
-            return {"success": True}
-        elif path == "/health" and method == "GET":
-            return {"status": "ok", "device": "MOCK-NodeMCU-SmartLight", "uptime_seconds": 0}
-        return {"success": True}
-
+    """Send HTTP request to ESP8266 device at DEVICE_IP."""
     async with httpx.AsyncClient(timeout=DEVICE_TIMEOUT) as client:
         url = f"{DEVICE_BASE_URL}{path}"
         if method == "GET":
@@ -91,7 +59,10 @@ async def device_request(method: str, path: str, body: dict = None) -> dict:
 
 # ─── Tool Handlers ─────────────────────────────────────────
 async def handle_set_light(args: dict) -> str:
-    body = {"on": args["on"]}
+    """Turn light on/off with optional color and brightness."""
+    body: dict = {}
+    if "on" in args:
+        body["on"] = args["on"]
     if "color" in args:
         body["color"] = resolve_color(args["color"])
     if "brightness" in args:
@@ -101,42 +72,85 @@ async def handle_set_light(args: dict) -> str:
     if state.get("on"):
         return (
             f"Light is ON. Color: {state.get('color', 'unknown')}, "
-            f"Brightness: {state.get('brightness', 'unknown')}%"
+            f"Brightness: {state.get('brightness', 'unknown')}%, "
+            f"Effect: {state.get('effect', 'none')}"
         )
-    else:
-        return "Light is OFF."
+    return "Light is OFF."
 
 
 async def handle_get_light_status(args: dict) -> str:
+    """Get current light state from device."""
     result = await device_request("GET", "/status")
     on_status = "ON" if result.get("on") else "OFF"
+    effect = result.get("effect", {})
+    effect_str = effect.get("type", "none") if isinstance(effect, dict) else str(effect)
     return (
         f"Light Status: {on_status}\n"
         f"Color: {result.get('color', 'unknown')}\n"
         f"Brightness: {result.get('brightness', 'unknown')}%\n"
+        f"RGB: R={result.get('rgb', {}).get('r', 0)}, "
+        f"G={result.get('rgb', {}).get('g', 0)}, "
+        f"B={result.get('rgb', {}).get('b', 0)}\n"
+        f"Effect: {effect_str}\n"
         f"Device: {result.get('device', 'unknown')}\n"
+        f"IP: {result.get('ip', 'unknown')}\n"
         f"Uptime: {result.get('uptime_seconds', 0)}s"
     )
 
 
 async def handle_set_color(args: dict) -> str:
-    hex_color = resolve_color(args["color"])
-    await device_request("POST", "/light", {"color": hex_color})
-    return f"Color changed to {args['color']} ({hex_color})."
+    """Change color without changing on/off state."""
+    color = resolve_color(args["color"])
+    result = await device_request("POST", "/light", {"color": color})
+    state = result.get("state", {})
+    return f"Color changed to {state.get('color', color)}."
 
 
 async def handle_set_brightness(args: dict) -> str:
+    """Adjust brightness level."""
     level = max(0, min(100, args["level"]))
     await device_request("POST", "/light", {"brightness": level})
     return f"Brightness set to {level}%."
 
 
-async def handle_display_text(args: dict) -> str:
-    body = {"text": args["text"]}
-    if "line" in args:
-        body["line"] = args["line"]
-    await device_request("POST", "/display", body)
-    return f"Displayed '{args['text']}' on OLED screen."
+async def handle_blink(args: dict) -> str:
+    """Blink the light with optional color, duration, and interval."""
+    body: dict = {}
+    if "color" in args:
+        body["color"] = resolve_color(args["color"])
+    body["blink"] = args.get("duration", 5)
+    if "interval" in args:
+        body["interval"] = args["interval"]
+    result = await device_request("POST", "/light", body)
+    state = result.get("state", {})
+    return f"Blinking {state.get('color', 'current')} for {body['blink']}s (interval: {body.get('interval', 300)}ms)."
+
+
+async def handle_pulse(args: dict) -> str:
+    """Pulse/fade effect on the light."""
+    body: dict = {}
+    if "color" in args:
+        body["color"] = resolve_color(args["color"])
+    body["pulse"] = args.get("duration", 10)
+    result = await device_request("POST", "/light", body)
+    state = result.get("state", {})
+    return f"Pulsing {state.get('color', 'current')} for {body['pulse']}s."
+
+
+async def handle_temp_color(args: dict) -> str:
+    """Show a color temporarily, then revert to previous state."""
+    body: dict = {
+        "color": resolve_color(args["color"]),
+        "duration": args.get("duration", 3),
+    }
+    result = await device_request("POST", "/light", body)
+    return f"Showing {body['color']} for {body['duration']}s, then reverting."
+
+
+async def handle_stop_effect(args: dict) -> str:
+    """Stop any active effect (blink, pulse)."""
+    await device_request("POST", "/light", {"effect": "stop"})
+    return "Effect stopped."
 
 
 TOOL_HANDLERS = {
@@ -144,8 +158,18 @@ TOOL_HANDLERS = {
     "get_light_status": handle_get_light_status,
     "set_color": handle_set_color,
     "set_brightness": handle_set_brightness,
-    "display_text": handle_display_text,
+    "blink": handle_blink,
+    "pulse": handle_pulse,
+    "temp_color": handle_temp_color,
+    "stop_effect": handle_stop_effect,
 }
+
+# ─── Available colors description ─────────────────────────
+_COLORS_DESC = (
+    "Color name (red, green, blue, yellow, orange, purple, violet, cyan, magenta, "
+    "pink, white, warm_white, cool_white, gold, silver, lime, teal, indigo, coral) "
+    "or hex code (#FF5500)"
+)
 
 # ─── MCP Tools Schema ─────────────────────────────────────
 TOOLS_SCHEMA = [
@@ -164,10 +188,7 @@ TOOLS_SCHEMA = [
                 },
                 "color": {
                     "type": "string",
-                    "description": (
-                        "Color name (red, blue, green, yellow, cyan, magenta, white, "
-                        "warm_white, orange, purple, pink) or hex code (#FF0000)"
-                    ),
+                    "description": _COLORS_DESC,
                 },
                 "brightness": {
                     "type": "integer",
@@ -183,7 +204,7 @@ TOOLS_SCHEMA = [
         "name": "get_light_status",
         "description": (
             "Get the current state of the smart light including on/off status, color, "
-            "and brightness. Use this when the user asks about the current light state."
+            "brightness, RGB values, active effects, and device info."
         ),
         "inputSchema": {
             "type": "object",
@@ -201,10 +222,7 @@ TOOLS_SCHEMA = [
             "properties": {
                 "color": {
                     "type": "string",
-                    "description": (
-                        "Color name (red, blue, green, yellow, cyan, magenta, white, "
-                        "warm_white, orange, purple, pink) or hex code (#FF0000)"
-                    ),
+                    "description": _COLORS_DESC,
                 },
             },
             "required": ["color"],
@@ -230,26 +248,80 @@ TOOLS_SCHEMA = [
         },
     },
     {
-        "name": "display_text",
+        "name": "blink",
         "description": (
-            "Show text on the OLED display attached to the smart light device. "
-            "Use this to display messages or status info."
+            "Make the light blink with optional color, duration, and speed. "
+            "Use this for alerts, notifications, or attention-getting effects."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "text": {
+                "color": {
                     "type": "string",
-                    "description": "Text to display on the OLED screen",
+                    "description": _COLORS_DESC,
                 },
-                "line": {
+                "duration": {
                     "type": "integer",
-                    "description": "Line number (1-4) to display on",
-                    "minimum": 1,
-                    "maximum": 4,
+                    "description": "How long to blink in seconds (0 = forever)",
+                    "minimum": 0,
+                },
+                "interval": {
+                    "type": "integer",
+                    "description": "Blink interval in milliseconds (default 300)",
+                    "minimum": 50,
                 },
             },
-            "required": ["text"],
+        },
+    },
+    {
+        "name": "pulse",
+        "description": (
+            "Make the light pulse (fade in/out) with optional color and duration. "
+            "Use this for a smooth breathing effect."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "color": {
+                    "type": "string",
+                    "description": _COLORS_DESC,
+                },
+                "duration": {
+                    "type": "integer",
+                    "description": "How long to pulse in seconds (0 = forever)",
+                    "minimum": 0,
+                },
+            },
+        },
+    },
+    {
+        "name": "temp_color",
+        "description": (
+            "Temporarily show a color for a few seconds, then revert to the previous state. "
+            "Use this for brief visual indicators (e.g., flash red for error, green for success)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "color": {
+                    "type": "string",
+                    "description": _COLORS_DESC,
+                },
+                "duration": {
+                    "type": "integer",
+                    "description": "How long to show the color in seconds (default 3)",
+                    "minimum": 1,
+                },
+            },
+            "required": ["color"],
+        },
+    },
+    {
+        "name": "stop_effect",
+        "description": "Stop any active effect (blink, pulse). The light stays on with its current color.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
         },
     },
 ]
@@ -436,7 +508,6 @@ async def health():
         "status": "ok",
         "server": "iot-light-controller",
         "version": "1.0.0",
-        "mock_mode": MOCK_MODE,
     }
 
 
@@ -456,6 +527,5 @@ if __name__ == "__main__":
 
     port = int(os.getenv("PORT", "8000"))
     print(f"Starting IoT Smart Light MCP Server on port {port}")
-    print(f"Mock mode: {MOCK_MODE}")
     print(f"Device URL: {DEVICE_BASE_URL}")
     uvicorn.run(app, host="0.0.0.0", port=port)
