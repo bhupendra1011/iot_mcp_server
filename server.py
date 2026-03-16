@@ -5,8 +5,9 @@ import uuid
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from sse_starlette.sse import EventSourceResponse
+from starlette.responses import StreamingResponse
 
 load_dotenv()
 
@@ -339,11 +340,13 @@ async def handle_mcp_request(request_data: dict) -> dict:
             "jsonrpc": "2.0",
             "id": req_id,
             "result": {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {"tools": {"listChanged": False}},
+                "protocolVersion": "2025-03-26",
+                "capabilities": {
+                    "tools": {"listChanged": False},
+                },
                 "serverInfo": {
                     "name": "iot-light-controller",
-                    "version": "1.0.0",
+                    "version": "2.0.0",
                 },
             },
         }
@@ -443,61 +446,122 @@ async def handle_mcp_request(request_data: dict) -> dict:
         }
 
 
-# ─── HTTP Transport ────────────────────────────────────────
+# ─── Friendly tool descriptions for progress messages ──────
+TOOL_PROGRESS_MSG = {
+    "set_light": "Sending on/off command to the smart light...",
+    "get_light_status": "Querying device status...",
+    "set_color": "Changing light color...",
+    "set_brightness": "Adjusting brightness...",
+    "blink": "Starting blink effect...",
+    "pulse": "Starting pulse effect...",
+    "temp_color": "Showing temporary color...",
+    "stop_effect": "Stopping active effect...",
+}
+
+
+def _sse_event(data: dict, event: str = "message") -> str:
+    """Format a single SSE event string."""
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+
+# ─── Streamable HTTP Transport ─────────────────────────────
+sessions: dict[str, bool] = {}
+
+
 @app.post("/mcp")
 async def mcp_endpoint(request: Request):
-    """HTTP transport — single JSON-RPC request/response."""
+    """Streamable HTTP transport — streams progress for tool calls."""
+    accept = request.headers.get("accept", "")
     body = await request.json()
-    response = await handle_mcp_request(body)
+    method = body.get("method", "")
+    req_id = body.get("id")
+
+    # Assign or reuse session
+    session_id = request.headers.get("mcp-session-id") or str(uuid.uuid4())
+    sessions[session_id] = True
+
+    if method == "initialize":
+        resp = await handle_mcp_request(body)
+        response = JSONResponse(content=resp)
+        response.headers["Mcp-Session-Id"] = session_id
+        return response
+
+    # For tool calls with streaming accepted, send progress + result via SSE
+    if "text/event-stream" in accept and method == "tools/call":
+        async def stream_tool():
+            params = body.get("params", {})
+            tool_name = params.get("name", "")
+            args = params.get("arguments", {})
+
+            progress_msg = TOOL_PROGRESS_MSG.get(tool_name, f"Running {tool_name}...")
+            color_info = args.get("color", "")
+            if color_info:
+                progress_msg = progress_msg.replace("...", f" ({color_info})...")
+
+            progress_notification = {
+                "jsonrpc": "2.0",
+                "method": "notifications/message",
+                "params": {
+                    "level": "info",
+                    "data": progress_msg,
+                },
+            }
+            yield _sse_event(progress_notification)
+
+            result = await handle_mcp_request(body)
+            yield _sse_event(result)
+
+        response = StreamingResponse(
+            stream_tool(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "Mcp-Session-Id": session_id,
+            },
+        )
+        return response
+
+    # Non-streaming: return plain JSON
+    resp = await handle_mcp_request(body)
+    response = JSONResponse(content=resp)
+    response.headers["Mcp-Session-Id"] = session_id
     return response
 
 
-# ─── SSE Transport ─────────────────────────────────────────
-sse_connections: dict[str, asyncio.Queue] = {}
+@app.get("/mcp")
+async def mcp_sse_stream(request: Request):
+    """GET /mcp — open an SSE stream for server-initiated messages (optional)."""
+    session_id = request.headers.get("mcp-session-id") or str(uuid.uuid4())
 
-
-@app.get("/sse")
-async def sse_endpoint(request: Request):
-    """SSE transport — persistent connection with session-based messaging."""
-    session_id = str(uuid.uuid4())
-    queue: asyncio.Queue = asyncio.Queue()
-    sse_connections[session_id] = queue
-
-    async def event_generator():
-        # Send the message endpoint as the first event
-        yield {
-            "event": "endpoint",
-            "data": f"/sse/message?sessionId={session_id}",
-        }
+    async def keep_alive():
         try:
             while True:
                 if await request.is_disconnected():
                     break
-                try:
-                    data = await asyncio.wait_for(queue.get(), timeout=30)
-                    yield {"event": "message", "data": json.dumps(data)}
-                except asyncio.TimeoutError:
-                    yield {"event": "ping", "data": "keepalive"}
+                yield _sse_event({"type": "ping"}, event="ping")
+                await asyncio.sleep(30)
         except asyncio.CancelledError:
             pass
-        finally:
-            sse_connections.pop(session_id, None)
 
-    return EventSourceResponse(event_generator())
+    return StreamingResponse(
+        keep_alive(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "Mcp-Session-Id": session_id,
+        },
+    )
 
 
-@app.post("/sse/message")
-async def sse_message(request: Request):
-    """Receive a JSON-RPC request for an active SSE session."""
-    session_id = request.query_params.get("sessionId")
-    if not session_id or session_id not in sse_connections:
-        return {"error": "Invalid or expired session"}
-
-    body = await request.json()
-    response = await handle_mcp_request(body)
-    queue = sse_connections[session_id]
-    await queue.put(response)
-    return {"status": "ok"}
+@app.delete("/mcp")
+async def mcp_close_session(request: Request):
+    """DELETE /mcp — close a session."""
+    session_id = request.headers.get("mcp-session-id")
+    if session_id:
+        sessions.pop(session_id, None)
+    return JSONResponse(content={"status": "closed"}, status_code=200)
 
 
 # ─── Health & Device Status ────────────────────────────────
@@ -507,7 +571,7 @@ async def health():
     return {
         "status": "ok",
         "server": "iot-light-controller",
-        "version": "1.0.0",
+        "version": "2.0.0",
     }
 
 
