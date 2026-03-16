@@ -2,6 +2,8 @@ import os
 import json
 import asyncio
 import uuid
+import logging
+import time
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
@@ -10,6 +12,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.responses import StreamingResponse
 
 load_dotenv()
+
+# ─── Logging Setup ────────────────────────────────────────
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger("iot-mcp")
 
 app = FastAPI(title="IoT Smart Light MCP Server")
 
@@ -25,6 +35,9 @@ DEVICE_IP = os.getenv("DEVICE_IP", "192.168.1.50")  # static IP of ESP8266/NodeM
 DEVICE_PORT = os.getenv("DEVICE_PORT", "80")
 DEVICE_TIMEOUT = int(os.getenv("DEVICE_TIMEOUT", "10"))
 DEVICE_BASE_URL = f"http://{DEVICE_IP}:{DEVICE_PORT}"
+
+logger.info(f"[STARTUP] DEVICE_IP={DEVICE_IP} DEVICE_PORT={DEVICE_PORT} DEVICE_TIMEOUT={DEVICE_TIMEOUT}s")
+logger.info(f"[STARTUP] DEVICE_BASE_URL={DEVICE_BASE_URL}")
 
 # ─── Valid Colors (must match Arduino's parseColor) ───────
 VALID_COLORS = [
@@ -48,14 +61,33 @@ def resolve_color(color_input: str) -> str:
 # ─── Device Communication ──────────────────────────────────
 async def device_request(method: str, path: str, body: dict = None) -> dict:
     """Send HTTP request to ESP8266 device at DEVICE_IP."""
-    async with httpx.AsyncClient(timeout=DEVICE_TIMEOUT) as client:
-        url = f"{DEVICE_BASE_URL}{path}"
-        if method == "GET":
-            resp = await client.get(url)
-        else:
-            resp = await client.post(url, json=body)
-        resp.raise_for_status()
-        return resp.json()
+    url = f"{DEVICE_BASE_URL}{path}"
+    logger.info(f"[DEVICE] {method} {url} body={body}")
+    start = time.time()
+    try:
+        async with httpx.AsyncClient(timeout=DEVICE_TIMEOUT) as client:
+            if method == "GET":
+                resp = await client.get(url)
+            else:
+                resp = await client.post(url, json=body)
+            elapsed = (time.time() - start) * 1000
+            logger.info(f"[DEVICE] Response {resp.status_code} in {elapsed:.0f}ms")
+            resp.raise_for_status()
+            data = resp.json()
+            logger.debug(f"[DEVICE] Response body: {json.dumps(data)[:500]}")
+            return data
+    except httpx.ConnectError as e:
+        elapsed = (time.time() - start) * 1000
+        logger.error(f"[DEVICE] CONNECT FAILED to {url} after {elapsed:.0f}ms: {e}")
+        raise
+    except httpx.TimeoutException as e:
+        elapsed = (time.time() - start) * 1000
+        logger.error(f"[DEVICE] TIMEOUT to {url} after {elapsed:.0f}ms (limit={DEVICE_TIMEOUT}s): {e}")
+        raise
+    except Exception as e:
+        elapsed = (time.time() - start) * 1000
+        logger.error(f"[DEVICE] ERROR {url} after {elapsed:.0f}ms: {type(e).__name__}: {e}")
+        raise
 
 
 # ─── Tool Handlers ─────────────────────────────────────────
@@ -471,10 +503,18 @@ sessions: dict[str, bool] = {}
 @app.post("/mcp")
 async def mcp_endpoint(request: Request):
     """Streamable HTTP transport — streams progress for tool calls."""
+    start = time.time()
     accept = request.headers.get("accept", "")
     body = await request.json()
     method = body.get("method", "")
     req_id = body.get("id")
+    client_ip = request.client.host if request.client else "unknown"
+
+    logger.info(f"[MCP] POST /mcp method={method} id={req_id} from={client_ip}")
+    logger.debug(f"[MCP] Headers: accept={accept}")
+    if method == "tools/call":
+        params = body.get("params", {})
+        logger.info(f"[MCP] Tool call: {params.get('name')} args={params.get('arguments')}")
 
     # Assign or reuse session
     session_id = request.headers.get("mcp-session-id") or str(uuid.uuid4())
@@ -482,6 +522,8 @@ async def mcp_endpoint(request: Request):
 
     if method == "initialize":
         resp = await handle_mcp_request(body)
+        elapsed = (time.time() - start) * 1000
+        logger.info(f"[MCP] initialize done in {elapsed:.0f}ms session={session_id}")
         response = JSONResponse(content=resp)
         response.headers["Mcp-Session-Id"] = session_id
         return response
@@ -509,6 +551,10 @@ async def mcp_endpoint(request: Request):
             yield _sse_event(progress_notification)
 
             result = await handle_mcp_request(body)
+            elapsed = (time.time() - start) * 1000
+            is_err = result.get("result", {}).get("isError", False)
+            logger.info(f"[MCP] tools/call done in {elapsed:.0f}ms error={is_err}")
+            logger.debug(f"[MCP] Result: {json.dumps(result)[:500]}")
             yield _sse_event(result)
 
         response = StreamingResponse(
@@ -524,6 +570,8 @@ async def mcp_endpoint(request: Request):
 
     # Non-streaming: return plain JSON
     resp = await handle_mcp_request(body)
+    elapsed = (time.time() - start) * 1000
+    logger.info(f"[MCP] {method} done in {elapsed:.0f}ms (non-streaming)")
     response = JSONResponse(content=resp)
     response.headers["Mcp-Session-Id"] = session_id
     return response
